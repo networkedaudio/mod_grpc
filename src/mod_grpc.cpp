@@ -85,12 +85,12 @@ namespace mod_grpc {
             aleg << request->endpoints()[i];
         }
 
+        if (switch_event_create_plain(&var_event, SWITCH_EVENT_CHANNEL_DATA) != SWITCH_STATUS_SUCCESS) {
+            std::string msg("Can't create variable event");
+            return Status(StatusCode::INTERNAL, msg);
+        }
+        switch_event_add_header_string(var_event, SWITCH_STACK_BOTTOM, "wbt_originate", "true");
         if (request->variables_size() > 0) {
-            if (switch_event_create_plain(&var_event, SWITCH_EVENT_CHANNEL_DATA) != SWITCH_STATUS_SUCCESS) {
-                std::string msg("Can't create variable event");
-                return Status(StatusCode::INTERNAL, msg);
-            }
-
             for (const auto &kv: request->variables()) {
                 switch_event_add_header_string(var_event, SWITCH_STACK_BOTTOM, kv.first.c_str(), kv.second.c_str());
             }
@@ -739,6 +739,29 @@ namespace mod_grpc {
         return Status::OK;
     }
 
+    Status ApiServiceImpl::BreakPark(::grpc::ServerContext *context, const ::fs::BreakParkRequest *request,
+                                     ::fs::BreakParkResponse *response) {
+        response->set_ok(false);
+
+        if (!request->id().empty()) {
+            switch_core_session_t *session;
+            session = switch_core_session_locate(request->id().c_str());
+            if (session) {
+                switch_channel_t *channel = switch_core_session_get_channel(session);
+
+                if (switch_channel_test_flag(channel, CF_PARK)) {
+                    switch_channel_clear_flag(channel, CF_PARK);
+                    response->set_ok(true);
+                }
+
+                switch_core_session_rwunlock(session);
+                return Status::OK;
+            }
+        }
+
+        return Status::OK;
+    }
+
     ServerImpl::ServerImpl(Config config_) {
         if (!config_.grpc_host) {
             char ipV4_[80];
@@ -902,6 +925,13 @@ namespace mod_grpc {
                         &config.push_wait_callback,
                         2000,
                         nullptr, "push_wait_callback", "Push wait callback time"),
+                SWITCH_CONFIG_ITEM(
+                        "heartbeat",
+                        SWITCH_CONFIG_INT,
+                        CONFIG_RELOADABLE,
+                        &config.heartbeat,
+                        0,
+                        nullptr, "heartbeat", "Enable Media Heartbeat"),
                 SWITCH_CONFIG_ITEM(
                         "push_fcm_enabled",
                         SWITCH_CONFIG_BOOL,
@@ -1157,6 +1187,15 @@ namespace mod_grpc {
         return SWITCH_STATUS_SUCCESS;
     }
 
+    static switch_status_t wbt_tweaks_on_init(switch_core_session_t *session) {
+        if (heartbeat_interval) {
+            auto channel = switch_core_session_get_channel(session);
+            switch_core_session_enable_heartbeat(session, heartbeat_interval);
+            switch_channel_set_variable_var_check(channel, "wbt_heartbeat", std::to_string(heartbeat_interval).c_str(), SWITCH_FALSE);
+        }
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     static PushData* get_push_body(const char *uuid, switch_channel *channel, int autoDelayTime) {
         auto *pData = new PushData;
         pData->call_id = std::string(uuid);
@@ -1252,19 +1291,38 @@ namespace mod_grpc {
                 try {
                     switch_core_session_get_read_impl(ud->session, &ud->read_impl);
 
-                    auto thresh = switch_channel_get_variable(ud->channel, "wbt_ai_vad_threshold");
-                    if (thresh) {
-                        auto t = atoi(thresh);
-                        if (t) {
+                    auto var = switch_channel_get_variable(ud->channel, "wbt_ai_vad_threshold");
+                    if (var) {
+                        auto tmp = atoi(var);
+                        if (tmp) {
                             ud->vad = switch_vad_init((int) ud->read_impl.actual_samples_per_second, 1);
                             ud->stop_vad_on_answer =
                                     switch_true(switch_channel_get_variable(ud->channel, "wbt_ai_vad_stop_on_answer")) == 1;
-                            switch_vad_set_param(ud->vad, "thresh", t);
+                            switch_vad_set_param(ud->vad, "thresh", tmp);
                             switch_log_printf(
                                     SWITCH_CHANNEL_SESSION_LOG(ud->session),
                                     SWITCH_LOG_DEBUG,
-                                    "amd use vad thresh %d \n", t);
+                                    "amd use vad thresh %d \n", tmp);
+
+                            if ((var = switch_channel_get_variable(ud->channel, "wbt_ai_vad_debug"))) {
+                                tmp = atoi(var);
+                                if (tmp < 0) tmp = 0;
+
+                                switch_vad_set_param(ud->vad, "debug", tmp);
+                            };
                         }
+                        var = switch_channel_get_variable(ud->channel, "wbt_vad_max_silence_sec");
+                        if (var) {
+                            tmp = atoi(var);
+                            if (tmp) {
+                                ud->max_silence_sec = tmp;
+                                switch_log_printf(
+                                        SWITCH_CHANNEL_SESSION_LOG(ud->session),
+                                        SWITCH_LOG_DEBUG,
+                                        "amd use vad maximum silence seconds %d \n", tmp);
+                            }
+                        }
+
                     }
 
                     if (ud->read_impl.actual_samples_per_second != MODEL_RATE) {
@@ -1292,10 +1350,6 @@ namespace mod_grpc {
                         switch_resample_destroy(&ud->resampler);
                     }
 
-                    if (ud->vad) {
-                        switch_vad_destroy(&ud->vad);
-                    }
-
                     ud->client_->Finish();
 
                     std::string amd_result;
@@ -1304,20 +1358,25 @@ namespace mod_grpc {
                     bool skip_hangup = false;
 
                     if (ud->client_->reply.result().empty()) {
-                        // TODO
-                        skip_hangup = true;
                         amd_result = "undefined";
-                        switch_channel_set_variable(ud->channel, "execute_on_answer", NULL); // TODO
-                        do_execute(ud->session, ud->channel, AMD_EXECUTE_VARIABLE);
+                        if (ud->vad && switch_channel_test_flag(ud->channel, CF_ANSWERED)) {
+                            amd_result = "silence";
+                        }
+//                        switch_channel_set_variable(ud->channel, "execute_on_answer", NULL); // TODO
                     } else {
                         amd_result = ud->client_->reply.result();
-                        for (auto &l : ud->positive) {
-                            if (l == amd_result) {
-                                skip_hangup = true;
-                                do_execute(ud->session, ud->channel, AMD_EXECUTE_VARIABLE);
-                                break;
-                            }
+                    }
+
+                    for (auto &l : ud->positive) {
+                        if (l == amd_result) {
+                            skip_hangup = true;
+                            do_execute(ud->session, ud->channel, AMD_EXECUTE_VARIABLE);
+                            break;
                         }
+                    }
+
+                    if (ud->vad) {
+                        switch_vad_destroy(&ud->vad);
                     }
 
                     switch_channel_set_variable(ud->channel, WBT_AMD_AI, amd_result.c_str());
@@ -1337,8 +1396,16 @@ namespace mod_grpc {
                                 "ML amd result: %s [%s]\n", amd_result.c_str(), s.c_str());
                     }
 
-                    switch_channel_set_variable(ud->channel, WBT_AMD_AI_POSITIVE, !skip_hangup ? "false" : "true");
-                    amd_fire_event(ud->channel);
+                    auto ready = switch_channel_ready(ud->channel);
+                    switch_channel_set_variable(ud->channel, WBT_AMD_AI_POSITIVE, !ready || !skip_hangup ? "false" : "true");
+                    if (ready) {
+                        amd_fire_event(ud->channel);
+                    } else {
+                        switch_log_printf(
+                                SWITCH_CHANNEL_SESSION_LOG(ud->session),
+                                SWITCH_LOG_WARNING,
+                                "GRPC stream: skip amd event, channel state is hangup \n");
+                    }
                     if (!skip_hangup) {
                         switch_channel_hangup(ud->channel, SWITCH_CAUSE_NORMAL_UNSPECIFIED);
                     }
@@ -1366,14 +1433,17 @@ namespace mod_grpc {
                 try {
                     status = switch_core_media_bug_read(bug, &read_frame, SWITCH_FALSE);
                     if (status != SWITCH_STATUS_SUCCESS && status != SWITCH_STATUS_BREAK) {
-                        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "switch_core_media_bug_read SWITCH_TRUE \n");
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ud->session), SWITCH_LOG_DEBUG, "switch_core_media_bug_read SWITCH_TRUE \n");
                         return SWITCH_TRUE;
                     };
 
                     switch_vad_state_t vad_state = SWITCH_VAD_STATE_ERROR;
 
                     if (ud->vad) {
-                        if (ud->stop_vad_on_answer && switch_channel_test_flag(ud->channel, CF_ANSWERED)) {
+                        if (!ud->answered) {
+                            ud->answered = switch_channel_test_flag(ud->channel, CF_ANSWERED) ;
+                        }
+                        if (ud->stop_vad_on_answer && ud->answered) {
                             switch_vad_destroy(&ud->vad);
                             ud->vad = nullptr;
                         } else {
@@ -1381,9 +1451,21 @@ namespace mod_grpc {
                             vad_state = switch_vad_process(ud->vad, (int16_t *) read_frame.data,
                                                            read_frame.datalen / 2);
                             if (vad_state == SWITCH_VAD_STATE_STOP_TALKING) {
-                                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "amd vad reset: %s\n",
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ud->session), SWITCH_LOG_DEBUG, "amd vad reset: %s\n",
                                                   switch_vad_state2str(vad_state));
                                 switch_vad_reset(ud->vad);
+                            }
+
+                            if (ud->max_silence_sec) {
+                                ud->frame_ms = 1000 / (ud->read_impl.actual_samples_per_second / read_frame.samples);
+                                if (vad_state == SWITCH_VAD_STATE_NONE) {
+                                    ud->silence_ms += ud->frame_ms;
+                                } else {
+                                    ud->silence_ms = 0;
+                                }
+
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ud->session), SWITCH_LOG_DEBUG, "amd vad state: %s [silence = %d]\n",
+                                                  switch_vad_state2str(vad_state), ud->silence_ms / 1000);
                             }
                         }
                     }
@@ -1401,6 +1483,11 @@ namespace mod_grpc {
 
                     if (ud->client_->Finished()) {
                         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Finished\n");
+                        return SWITCH_FALSE;
+                    }
+
+                    if (ud->max_silence_sec && ud->max_silence_sec <= (ud->silence_ms / 1000)) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ud->session), SWITCH_LOG_DEBUG, "Maximum silence seconds\n");
                         return SWITCH_FALSE;
                     }
 
@@ -1459,6 +1546,8 @@ namespace mod_grpc {
         ud->positive = std::move(positive_labels);
         ud->client_ = server_->AsyncStreamPCMA(domain_id, switch_channel_get_uuid(channel), switch_channel_get_uuid(channel), MODEL_RATE);
         ud->vad = nullptr;
+        ud->max_silence_sec = 0;
+        ud->silence_ms = 0;
 
         if (!ud->client_) {
             err = "ai_create_client";
@@ -1598,8 +1687,15 @@ namespace mod_grpc {
     SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load) {
         try {
             *module_interface = switch_loadable_module_create_module_interface(pool, modname);
+            auto config = loadConfig();
             switch_application_interface_t *app_interface;
             switch_api_interface_t *api_interface;
+            heartbeat_interval = 0;
+            if (config.heartbeat) {
+                heartbeat_interval = config.heartbeat;
+                wbt_state_handlers.on_init = wbt_tweaks_on_init;
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Use session heartbeat, %d seconds\n", heartbeat_interval);
+            }
             switch_core_add_state_handler(&wbt_state_handlers);
             SWITCH_ADD_API(api_interface, "wbt_version", "Show build version", version_api_function, "");
             SWITCH_ADD_APP(app_interface, "wbt_queue", "wbt_queue", "wbt_queue", wbr_queue_function, "", SAF_NONE);
@@ -1619,7 +1715,7 @@ namespace mod_grpc {
 
             switch_event_reserve_subclass("SWITCH_EVENT_CUSTOM::" EVENT_NAME);
 
-            server_ = new ServerImpl(loadConfig());
+            server_ = new ServerImpl(config);
 
             server_->Run();
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Module loaded completed FCM=%d APN=%d\n", server_->UseFCM(), server_->UseAPN());

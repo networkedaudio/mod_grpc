@@ -46,7 +46,7 @@ extern "C" {
 
 #define get_str(c) c ? std::string(c) : std::string()
 
-enum CallActions { Ringing, Active, Bridge, Hold, DTMF, Voice, Silence, Execute, Update, JoinQueue, LeavingQueue, AMD, Hangup, Eavesdrop };
+enum CallActions { Ringing, Active, Bridge, Hold, DTMF, Voice, Silence, Execute, Update, JoinQueue, LeavingQueue, AMD, Hangup, Eavesdrop, Heartbeat };
 
 //TODO
 static const char* callEventStr(CallActions e) {
@@ -79,6 +79,8 @@ static const char* callEventStr(CallActions e) {
             return "amd";
         case Eavesdrop:
             return "eavesdrop";
+        case Heartbeat:
+            return "heartbeat";
         default:
             return "unknown";
     }
@@ -162,14 +164,14 @@ public:
         cJSON_AddItemToObject(body_, header, attr);
     }
 
-    void addArrayValue(switch_event_header_t *e, const char *var_name) {
+    void addArrayValue(switch_event_header_t *e, const char *var_name, bool number) {
         cJSON *arr = cJSON_CreateArray();
         if (e->idx) {
             for (int i = 0; i < e->idx; i++) {
-                cJSON_AddItemToArray(arr, cJSON_CreateString(e->array[i]));
+                cJSON_AddItemToArray(arr, number ? cJSON_CreateNumber(std::atof(e->array[i])) : cJSON_CreateString(e->array[i]));
             }
         } else if (e->value) {
-            cJSON_AddItemToArray(arr, cJSON_CreateString(e->value));
+            cJSON_AddItemToArray(arr, number ? cJSON_CreateNumber(std::atof(e->value)) : cJSON_CreateString(e->value));
         }
         addAttribute(var_name, arr);
     }
@@ -601,6 +603,18 @@ public:
         if (event_->getVar("variable_wbt_hide_number") == "true") {
             addAttribute("hideNumber", true);
         }
+        if (event_->getVar("variable_wbt_originate") == "true") {
+            addAttribute("originate", true);
+        }
+
+        auto wbt_heartbeat = event_->getVar("variable_wbt_heartbeat");
+        if (!wbt_heartbeat.empty()) {
+            int sec = 0;
+            sscanf( wbt_heartbeat.c_str(), "%d", &sec );
+            if (sec) {
+                addAttribute("heartbeat", sec);
+            }
+        }
         auto info = getCallInfo();
         auto eavesdrop = event_->getVar("variable_wbt_eavesdrop_type");
         if (!eavesdrop.empty()) {
@@ -743,6 +757,10 @@ public:
         auto wbt_talk_sec = get_str(switch_event_get_header(e, "variable_wbt_talk_sec"));
         auto wbt_amd = get_str(switch_event_get_header(e, "variable_"  WBT_AMD_AI));
         auto skip_cdr = switch_false(switch_event_get_header(e, "variable_" SKIP_EVENT_VARIABLE));
+        auto sip_hangup_phrase = get_str(switch_event_get_header(e, "variable_sip_hangup_phrase"));
+        if (sip_hangup_phrase.empty()) {
+            sip_hangup_phrase = get_str(switch_event_get_header(e, "variable_sip_invite_failure_phrase"));
+        }
 
         auto eavesdrop = event_->getVar("variable_wbt_eavesdrop_type");
         if (!eavesdrop.empty()) {
@@ -752,6 +770,10 @@ public:
 //        DUMP_EVENT(e);
         if (skip_cdr) {
             addAttribute("cdr", false);
+        }
+
+        if (event_->getVar("variable_wbt_notification_hangup") == "true") {
+            addAttribute("notification_hangup", true);
         }
 
         addIfExists(body_, "amd_result", "variable_amd_result");
@@ -837,7 +859,12 @@ public:
 
         auto hp = switch_event_get_header_ptr(e, "variable_wbt_tags");
         if (hp) {
-            addArrayValue(hp, "tags");
+            addArrayValue(hp, "tags", false);
+        }
+
+        auto sids = switch_event_get_header_ptr(e, "variable_wbt_schema_ids");
+        if (sids) {
+            addArrayValue(sids, "schema_ids", true);
         }
 
         if (!wbt_amd.empty()) {
@@ -846,8 +873,12 @@ public:
             addAttribute( "amd_ai_positive", positive == "true");
             hp = switch_event_get_header_ptr(e, "variable_" WBT_AMD_AI_LOG);
             if (hp) {
-                addArrayValue(hp, "amd_ai_logs");
+                addArrayValue(hp, "amd_ai_logs", false);
             }
+        }
+
+        if (!sip_hangup_phrase.empty()) {
+            addAttribute("hangup_phrase", sip_hangup_phrase);
         }
     };
 };
@@ -891,6 +922,13 @@ public:
         addAttribute("state", state);
         addIfExists(body_, "type", "variable_wbt_eavesdrop_type");
         notifyEavesdropPartner(state);
+    };
+};
+
+template <> class CallEvent<Heartbeat> : public BaseCallEvent {
+public:
+    explicit CallEvent(switch_event_t *e) : BaseCallEvent(Heartbeat, e) {
+
     };
 };
 
